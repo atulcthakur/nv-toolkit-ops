@@ -32,6 +32,7 @@ The unified API uses:
 - ewald_summation(compute_forces=, batch_idx=)
 """
 
+import numpy as np
 import pytest
 import torch
 from torchpme.lib.kvectors import _generate_kvectors as _generate_kvectors_torchpme
@@ -1570,14 +1571,18 @@ class TestExplicitChargeGradients:
         n2 = len(system2.positions)
 
         positions = torch.tensor(
-            list(system1.positions) + list(system2.positions),
+            np.concatenate([system1.positions, system2.positions]),
             dtype=dtype,
             device=device,
         )
         charges = torch.tensor(
-            list(system1.charges) + list(system2.charges), dtype=dtype, device=device
+            np.concatenate([system1.charges, system2.charges]),
+            dtype=dtype,
+            device=device,
         )
-        cells = torch.tensor([system1.cell, system2.cell], dtype=dtype, device=device)
+        cells = torch.tensor(
+            np.stack([system1.cell, system2.cell]), dtype=dtype, device=device
+        )
         batch_idx = torch.tensor([0] * n1 + [1] * n2, dtype=torch.int32, device=device)
         pbc = torch.tensor([[True, True, True], [True, True, True]], device=device)
         alpha = torch.tensor([0.3, 0.3], dtype=dtype, device=device)
@@ -1789,14 +1794,18 @@ class TestExplicitChargeGradients:
         n2 = len(system2.positions)
 
         positions = torch.tensor(
-            list(system1.positions) + list(system2.positions),
+            np.concatenate([system1.positions, system2.positions]),
             dtype=dtype,
             device=device,
         )
         charges = torch.tensor(
-            list(system1.charges) + list(system2.charges), dtype=dtype, device=device
+            np.concatenate([system1.charges, system2.charges]),
+            dtype=dtype,
+            device=device,
         )
-        cells = torch.tensor([system1.cell, system2.cell], dtype=dtype, device=device)
+        cells = torch.tensor(
+            np.stack([system1.cell, system2.cell]), dtype=dtype, device=device
+        )
         batch_idx = torch.tensor([0] * n1 + [1] * n2, dtype=torch.int32, device=device)
         pbc = torch.tensor([[True, True, True], [True, True, True]], device=device)
         alpha = torch.tensor([0.3, 0.3], dtype=dtype, device=device)
@@ -2011,14 +2020,18 @@ class TestExplicitReciprocalChargeGradients:
         n2 = len(system2.positions)
 
         positions = torch.tensor(
-            list(system1.positions) + list(system2.positions),
+            np.concatenate([system1.positions, system2.positions]),
             dtype=dtype,
             device=device,
         )
         charges = torch.tensor(
-            list(system1.charges) + list(system2.charges), dtype=dtype, device=device
+            np.concatenate([system1.charges, system2.charges]),
+            dtype=dtype,
+            device=device,
         )
-        cells = torch.tensor([system1.cell, system2.cell], dtype=dtype, device=device)
+        cells = torch.tensor(
+            np.stack([system1.cell, system2.cell]), dtype=dtype, device=device
+        )
         batch_idx = torch.tensor([0] * n1 + [1] * n2, dtype=torch.int32, device=device)
         alpha = torch.tensor([0.3, 0.3], dtype=dtype, device=device)
 
@@ -4474,6 +4487,51 @@ class TestEwaldSummationAutoParameters:
         assert forces.shape == (2, 3)
         assert torch.isfinite(energies).all()
         assert torch.isfinite(forces).all()
+
+    @pytest.mark.parametrize("device", ["cuda", "cpu"])
+    def test_batch_auto_estimate_alpha_and_k_cutoff(self, device):
+        """Test batch auto-estimation uses a shared maximum reciprocal cutoff."""
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        device = torch.device(device)
+
+        positions = torch.tensor(
+            [[2.0, 5.0, 5.0], [8.0, 5.0, 5.0], [3.0, 5.0, 5.0], [7.0, 5.0, 5.0]],
+            dtype=torch.float64,
+            device=device,
+        )
+        charges = torch.tensor(
+            [1.0, -1.0, 1.0, -1.0], dtype=torch.float64, device=device
+        )
+        cell = (
+            torch.eye(3, dtype=torch.float64, device=device)
+            .unsqueeze(0)
+            .expand(2, -1, -1)
+            .contiguous()
+            * 10.0
+        )
+        batch_idx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+        neighbor_list = torch.tensor(
+            [[0, 1, 2, 3], [1, 0, 3, 2]], dtype=torch.int32, device=device
+        )
+        neighbor_ptr = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device=device)
+        neighbor_shifts = torch.zeros((4, 3), dtype=torch.int32, device=device)
+
+        energies = ewald_summation(
+            positions,
+            charges,
+            cell,
+            neighbor_list=neighbor_list,
+            neighbor_ptr=neighbor_ptr,
+            neighbor_shifts=neighbor_shifts,
+            alpha=None,
+            k_cutoff=None,
+            batch_idx=batch_idx,
+            compute_forces=False,
+        )
+
+        assert energies.shape == (4,)
+        assert torch.isfinite(energies).all()
 
 
 class TestAutogradWithMatrixFormat:

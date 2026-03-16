@@ -17,11 +17,25 @@ namespace. This guide provides a mapping of old import paths to new ones.
 | `from nvalchemiops.neighbors import neighbor_list` | `from nvalchemiops.torch.neighbors import neighbor_list` |
 | `from nvalchemiops.neighbors import estimate_max_neighbors` | `from nvalchemiops.torch.neighbors.neighbor_utils import estimate_max_neighbors` |
 | `from nvalchemiops.neighborlist import neighbor_list` | `from nvalchemiops.torch.neighbors import neighbor_list` |
+| `from nvalchemiops.neighborlist import cell_list` | `from nvalchemiops.torch.neighbors import cell_list` |
 
 ## Backwards Compatibility
 
 The old import paths will continue to work but will emit `DeprecationWarning`
 messages. They will be removed in a future release.
+
+## Naive PBC Metadata Changes
+
+Advanced callers that precompute periodic metadata for naive neighbor-list
+methods should update cached arguments as follows:
+
+| Old Cached Inputs | New Cached Inputs |
+|-------------------|-------------------|
+| `shift_range_per_dimension`, `shift_offset`, `total_shifts` | `shift_range_per_dimension`, `num_shifts_per_system`, `max_shifts_per_system` |
+
+The public Torch and JAX APIs now decode periodic shifts on-the-fly inside the
+neighbor kernels. Materialized shift buffers and `shift_offset` / `total_shifts`
+are no longer part of the public naive-PBC workflow.
 
 ## Warp Kernels
 
