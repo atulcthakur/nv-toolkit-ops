@@ -3136,75 +3136,6 @@ def ewald_reciprocal_space(
 ###########################################################################################
 
 
-def _validate_slab_cell_geometry(cell: torch.Tensor, pbc: torch.Tensor) -> None:
-    """Raise if any slab system has degenerate triclinic geometry.
-
-    Slab correction supports orthorhombic and triclinic cells. For rows with
-    exactly two periodic directions, the two periodic cell vectors must span a
-    finite area and the non-periodic cell vector must have finite projected
-    height along the periodic-plane normal.
-
-    Parameters
-    ----------
-    cell : torch.Tensor, shape (B, 3, 3)
-        Unit cell matrices.
-    pbc : torch.Tensor, shape (B, 3), dtype=bool
-        Per-system periodic boundary conditions.
-
-    Raises
-    ------
-    ValueError
-        If any slab cell has zero/near-zero periodic area, projected height,
-        or volume.
-    """
-    slab_mask = pbc.sum(dim=1) == 2
-    if not torch.any(slab_mask):
-        return
-
-    cell_check = cell.detach()
-    pbc_check = pbc.detach()
-    eps = torch.finfo(cell_check.dtype).eps
-
-    for system_idx in torch.nonzero(slab_mask, as_tuple=False).flatten().tolist():
-        system_cell = cell_check[system_idx]
-        periodic_axes = (
-            torch.nonzero(pbc_check[system_idx], as_tuple=False).flatten().tolist()
-        )
-        nonperiodic_axes = (
-            torch.nonzero(~pbc_check[system_idx], as_tuple=False).flatten().tolist()
-        )
-        nonperiodic_axis = nonperiodic_axes[0]
-
-        periodic_a = system_cell[periodic_axes[0]]
-        periodic_b = system_cell[periodic_axes[1]]
-        nonperiodic_c = system_cell[nonperiodic_axis]
-
-        row_norms = torch.linalg.norm(system_cell, dim=1)
-        scale = torch.clamp(
-            row_norms.max(),
-            min=torch.tensor(1.0, dtype=cell_check.dtype, device=cell_check.device),
-        )
-        area_tol = 100.0 * eps * scale * scale
-        height_tol = 100.0 * eps * scale
-        vol_tol = 100.0 * eps * scale * scale * scale
-
-        area_vec = torch.cross(periodic_a, periodic_b, dim=0)
-        area = torch.linalg.norm(area_vec)
-        volume = torch.abs(torch.linalg.det(system_cell))
-
-        if (area <= area_tol).item():
-            raise ValueError(
-                "Slab correction requires the two periodic cell vectors to "
-                f"span a nonzero area for system {system_idx}."
-            )
-        height = torch.abs(torch.dot(nonperiodic_c, area_vec)) / area
-        if (height <= height_tol).item() or (volume <= vol_tol).item():
-            raise ValueError(
-                "Slab correction requires a nonzero projected slab height and "
-                f"cell volume for system {system_idx}."
-            )
-
-
 def _prepare_pbc_for_slab(
     pbc: torch.Tensor | None,
     num_systems: int,
@@ -3499,7 +3430,6 @@ def apply_slab_correction(
     """
     cell, num_systems = _prepare_cell(cell)
     pbc = _prepare_pbc_for_slab(pbc, num_systems, positions.device)
-    _validate_slab_cell_geometry(cell, pbc)
 
     if batch_idx is None:
         batch_idx = torch.zeros(
