@@ -26,6 +26,7 @@ Public API
 - ``ewald_real_space()``: Real-space component of Ewald summation
 - ``ewald_reciprocal_space()``: Reciprocal-space component
 - ``ewald_summation()``: Complete Ewald summation (real + reciprocal)
+- ``apply_slab_correction()``: Standalone 2D slab correction for Ewald outputs
 
 Mathematical Formulation
 ------------------------
@@ -97,6 +98,10 @@ from nvalchemiops.interactions.electrostatics.ewald_kernels import (
     _ewald_reciprocal_space_virial_kernel_overload,
     _ewald_subtract_self_energy_kernel_overload,
 )
+from nvalchemiops.interactions.electrostatics.slab_kernels import (
+    _slab_correction_kernel_overload,
+    _slab_reduce_moments_kernel_overload,
+)
 from nvalchemiops.torch.autograd import (
     OutputSpec,
     WarpAutogradContextManager,
@@ -115,6 +120,7 @@ from nvalchemiops.torch.interactions.electrostatics.parameters import (
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
 __all__ = [
+    "apply_slab_correction",
     "ewald_real_space",
     "ewald_reciprocal_space",
     "ewald_summation",
@@ -3125,6 +3131,398 @@ def ewald_reciprocal_space(
             return _build_result(energies, virial=virial)
 
 
+###########################################################################################
+########################### Slab Correction Op ############################################
+###########################################################################################
+
+
+def _validate_slab_cell_geometry(cell: torch.Tensor, pbc: torch.Tensor) -> None:
+    """Raise if any slab system has degenerate triclinic geometry.
+
+    Slab correction supports orthorhombic and triclinic cells. For rows with
+    exactly two periodic directions, the two periodic cell vectors must span a
+    finite area and the non-periodic cell vector must have finite projected
+    height along the periodic-plane normal.
+
+    Parameters
+    ----------
+    cell : torch.Tensor, shape (B, 3, 3)
+        Unit cell matrices.
+    pbc : torch.Tensor, shape (B, 3), dtype=bool
+        Per-system periodic boundary conditions.
+
+    Raises
+    ------
+    ValueError
+        If any slab cell has zero/near-zero periodic area, projected height,
+        or volume.
+    """
+    slab_mask = pbc.sum(dim=1) == 2
+    if not torch.any(slab_mask):
+        return
+
+    cell_check = cell.detach()
+    pbc_check = pbc.detach()
+    eps = torch.finfo(cell_check.dtype).eps
+
+    for system_idx in torch.nonzero(slab_mask, as_tuple=False).flatten().tolist():
+        system_cell = cell_check[system_idx]
+        periodic_axes = (
+            torch.nonzero(pbc_check[system_idx], as_tuple=False).flatten().tolist()
+        )
+        nonperiodic_axes = (
+            torch.nonzero(~pbc_check[system_idx], as_tuple=False).flatten().tolist()
+        )
+        nonperiodic_axis = nonperiodic_axes[0]
+
+        periodic_a = system_cell[periodic_axes[0]]
+        periodic_b = system_cell[periodic_axes[1]]
+        nonperiodic_c = system_cell[nonperiodic_axis]
+
+        row_norms = torch.linalg.norm(system_cell, dim=1)
+        scale = torch.clamp(
+            row_norms.max(),
+            min=torch.tensor(1.0, dtype=cell_check.dtype, device=cell_check.device),
+        )
+        area_tol = 100.0 * eps * scale * scale
+        height_tol = 100.0 * eps * scale
+        vol_tol = 100.0 * eps * scale * scale * scale
+
+        area_vec = torch.cross(periodic_a, periodic_b, dim=0)
+        area = torch.linalg.norm(area_vec)
+        volume = torch.abs(torch.linalg.det(system_cell))
+
+        if (area <= area_tol).item():
+            raise ValueError(
+                "Slab correction requires the two periodic cell vectors to "
+                f"span a nonzero area for system {system_idx}."
+            )
+        height = torch.abs(torch.dot(nonperiodic_c, area_vec)) / area
+        if (height <= height_tol).item() or (volume <= vol_tol).item():
+            raise ValueError(
+                "Slab correction requires a nonzero projected slab height and "
+                f"cell volume for system {system_idx}."
+            )
+
+
+def _prepare_pbc_for_slab(
+    pbc: torch.Tensor | None,
+    num_systems: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Validate and normalize the pbc tensor for slab correction.
+
+    Parameters
+    ----------
+    pbc : torch.Tensor or None
+        Per-system periodic boundary conditions. Accepted shapes:
+        - None: raises (slab correction requires explicit pbc).
+        - (3,) bool: broadcast to (num_systems, 3).
+        - (num_systems, 3) bool: used as-is.
+    num_systems : int
+        Number of systems in the batch.
+    device : torch.device
+        Target device for the output tensor.
+
+    Returns
+    -------
+    torch.Tensor, shape (num_systems, 3), dtype=bool
+        Validated pbc tensor.
+    """
+    if pbc is None:
+        raise ValueError(
+            "slab_correction=True requires an explicit `pbc` argument. "
+            "Pass a (3,) or (B, 3) bool tensor with True for periodic "
+            "directions and False for the non-periodic (slab) direction."
+        )
+    if pbc.dtype != torch.bool:
+        raise ValueError(f"`pbc` must be a bool tensor, got dtype={pbc.dtype}.")
+    if pbc.dim() == 1:
+        if pbc.shape[0] != 3:
+            raise ValueError(
+                f"`pbc` of shape (3,) expected, got shape {tuple(pbc.shape)}."
+            )
+        pbc = pbc.unsqueeze(0).expand(num_systems, 3).contiguous()
+    elif pbc.dim() == 2:
+        if pbc.shape != (num_systems, 3):
+            raise ValueError(
+                f"`pbc` of shape ({num_systems}, 3) expected, got "
+                f"shape {tuple(pbc.shape)}."
+            )
+    else:
+        raise ValueError(
+            f"`pbc` must be 1D (3,) or 2D (B, 3), got {pbc.dim()}D tensor."
+        )
+    return pbc.to(device=device, dtype=torch.bool)
+
+
+@warp_custom_op(
+    name="alchemiops::_slab_correction",
+    outputs=[
+        OutputSpec("slab_energies", wp.float64, lambda pos, *_: (pos.shape[0],)),
+        OutputSpec(
+            "slab_forces",
+            lambda pos, *_: get_wp_vec_dtype(pos.dtype),
+            lambda pos, *_: (pos.shape[0], 3),
+        ),
+        OutputSpec("slab_charge_grads", wp.float64, lambda pos, *_: (pos.shape[0],)),
+        OutputSpec(
+            "slab_virial",
+            lambda pos, *_: get_wp_mat_dtype(pos.dtype),
+            lambda pos, charges, cell, *_: (cell.shape[0], 3, 3),
+        ),
+    ],
+    grad_arrays=[
+        "slab_energies",
+        "slab_forces",
+        "slab_charge_grads",
+        "slab_virial",
+        "positions",
+        "charges",
+        "cell",
+    ],
+)
+def _slab_correction_op(
+    positions: torch.Tensor,
+    charges: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+    batch_idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute Yeh-Berkowitz (Ballenegger Eq. 29) slab correction for 2D
+    periodic systems.
+
+    Launches two Warp kernels: moment reduction followed by per-atom correction.
+    Returns slab-only contributions (caller adds to existing totals). The
+    non-periodic axis is determined per-system from pbc inside the kernel.
+
+    Orthorhombic and triclinic cells are supported. The slab normal follows
+    the periodic cell plane.
+
+    Parameters
+    ----------
+    positions : torch.Tensor, shape (N, 3)
+        Atomic coordinates.
+    charges : torch.Tensor, shape (N,)
+        Atomic charges.
+    cell : torch.Tensor, shape (B, 3, 3)
+        Unit cell matrices.
+    pbc : torch.Tensor, shape (B, 3), dtype=bool
+        Per-system periodic boundary conditions. True for periodic, False
+        for the non-periodic (slab) direction.
+    batch_idx : torch.Tensor, shape (N,), dtype=int32
+        System index for each atom.
+
+    Returns
+    -------
+    slab_energies : torch.Tensor, shape (N,), dtype=float64
+        Per-atom slab correction energy.
+    slab_forces : torch.Tensor, shape (N, 3), dtype matches positions
+        Per-atom slab correction force.
+    slab_charge_grads : torch.Tensor, shape (N,), dtype=float64
+        Per-atom slab correction charge gradient.
+    slab_virial : torch.Tensor, shape (B, 3, 3), dtype matches positions
+        Per-system slab correction virial.
+    """
+    num_atoms = positions.shape[0]
+    num_systems = cell.shape[0]
+    device = wp.device_from_torch(positions.device)
+    needs_grad_flag = needs_grad(positions, charges, cell)
+
+    input_dtype = positions.dtype
+    wp_scalar = get_wp_dtype(input_dtype)
+    wp_vec = get_wp_vec_dtype(input_dtype)
+    wp_mat = get_wp_mat_dtype(input_dtype)
+
+    # Slab geometry is computed inside the kernels so Warp autodiff tracks
+    # cell dependence.
+    wp_positions = warp_from_torch(positions, wp_vec, requires_grad=needs_grad_flag)
+    wp_charges = warp_from_torch(charges, wp_scalar, requires_grad=needs_grad_flag)
+    wp_batch_idx = warp_from_torch(batch_idx, wp.int32)
+    wp_pbc = warp_from_torch(pbc.contiguous(), wp.bool)
+    wp_cell = warp_from_torch(cell, wp_mat, requires_grad=needs_grad_flag)
+
+    # Allocate moment arrays (float64, zero-initialized).
+    # mz and mz2 are (B, 3), with projected M and M2 stored in the
+    # non-periodic pbc-axis slot.
+    mz_t = torch.zeros(num_systems, 3, device=positions.device, dtype=torch.float64)
+    mz2_t = torch.zeros(num_systems, 3, device=positions.device, dtype=torch.float64)
+    qtotal_t = torch.zeros(num_systems, device=positions.device, dtype=torch.float64)
+    wp_mz = warp_from_torch(mz_t, wp.float64, requires_grad=needs_grad_flag)
+    wp_mz2 = warp_from_torch(mz2_t, wp.float64, requires_grad=needs_grad_flag)
+    wp_qtotal = warp_from_torch(qtotal_t, wp.float64, requires_grad=needs_grad_flag)
+
+    # Allocate output arrays
+    energy_in_t = torch.zeros(num_atoms, device=positions.device, dtype=torch.float64)
+    wp_energy_in = warp_from_torch(
+        energy_in_t, wp.float64, requires_grad=needs_grad_flag
+    )
+
+    slab_energies = torch.zeros(num_atoms, device=positions.device, dtype=torch.float64)
+    wp_slab_energies = warp_from_torch(
+        slab_energies, wp.float64, requires_grad=needs_grad_flag
+    )
+
+    slab_forces = torch.zeros(num_atoms, 3, device=positions.device, dtype=input_dtype)
+    wp_slab_forces = warp_from_torch(slab_forces, wp_vec, requires_grad=needs_grad_flag)
+
+    slab_charge_grads = torch.zeros(
+        num_atoms, device=positions.device, dtype=torch.float64
+    )
+    wp_slab_charge_grads = warp_from_torch(
+        slab_charge_grads, wp.float64, requires_grad=needs_grad_flag
+    )
+
+    slab_virial = torch.zeros(
+        num_systems, 3, 3, device=positions.device, dtype=input_dtype
+    )
+    wp_slab_virial = warp_from_torch(slab_virial, wp_mat, requires_grad=needs_grad_flag)
+
+    with WarpAutogradContextManager(needs_grad_flag) as tape:
+        wp.launch(
+            _slab_reduce_moments_kernel_overload[wp_scalar],
+            dim=num_atoms,
+            inputs=[
+                wp_positions,
+                wp_charges,
+                wp_batch_idx,
+                wp_pbc,
+                wp_cell,
+                wp_mz,
+                wp_mz2,
+                wp_qtotal,
+            ],
+            device=device,
+        )
+
+        wp.launch(
+            _slab_correction_kernel_overload[wp_scalar],
+            dim=num_atoms,
+            inputs=[
+                wp_positions,
+                wp_charges,
+                wp_batch_idx,
+                wp_pbc,
+                wp_cell,
+                wp_mz,
+                wp_mz2,
+                wp_qtotal,
+                wp_energy_in,
+                wp_slab_energies,
+                wp_slab_forces,
+                wp_slab_charge_grads,
+                wp_slab_virial,
+            ],
+            device=device,
+        )
+
+    if needs_grad_flag:
+        attach_for_backward(
+            slab_energies,
+            tape=tape,
+            slab_energies=wp_slab_energies,
+            slab_forces=wp_slab_forces,
+            slab_charge_grads=wp_slab_charge_grads,
+            slab_virial=wp_slab_virial,
+            positions=wp_positions,
+            charges=wp_charges,
+            cell=wp_cell,
+        )
+
+    return slab_energies, slab_forces, slab_charge_grads, slab_virial
+
+
+def apply_slab_correction(
+    positions: torch.Tensor,
+    charges: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+    batch_idx: torch.Tensor | None = None,
+    compute_forces: bool = False,
+    compute_charge_gradients: bool = False,
+    compute_virial: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Yeh-Berkowitz slab correction for 2D periodic electrostatics, with the
+    Ballenegger et al. (2009) Eq. 29 extension for non-neutral systems.
+
+    Returns the slab-correction contribution (per-atom energy and optionally
+    per-atom force, charge gradient, and per-system virial). The caller adds
+    these to the corresponding 3D Ewald quantities; in normal usage the
+    correction is invoked through ``ewald_summation(..., slab_correction=True)``.
+
+    Background-charge convention
+    ----------------------------
+    For systems with net charge :math:`Q \\ne 0`, the formula corresponds to a
+    uniform-volume neutralizing background (the same convention used by
+    standard 3D Ewald). This matches LAMMPS and Ballenegger et al. (2009)
+    Eq. 29.
+
+    Cell geometry
+    -------------
+    Orthorhombic and triclinic cells are supported. For triclinic slab
+    systems, the slab normal follows the plane spanned by the two periodic
+    cell vectors.
+
+    Parameters
+    ----------
+    positions : torch.Tensor, shape (N, 3)
+        Atomic coordinates.
+    charges : torch.Tensor, shape (N,)
+        Atomic charges.
+    cell : torch.Tensor, shape (3, 3) or (B, 3, 3)
+        Unit cell matrices.
+    pbc : torch.Tensor, shape (3,) or (B, 3), dtype=bool
+        Per-system periodic boundary conditions. True for periodic directions,
+        False for the non-periodic (slab) direction. Systems whose pbc is not
+        slab-like (i.e., has anything other than exactly one False entry)
+        contribute zero.
+    batch_idx : torch.Tensor, shape (N,), dtype=int32, optional
+        System index for each atom. Defaults to all zeros (single system).
+    compute_forces : bool, default=False
+        If True, return per-atom forces.
+    compute_charge_gradients : bool, default=False
+        If True, return per-atom charge gradients dE_slab/dq_i.
+    compute_virial : bool, default=False
+        If True, return per-system virial tensor using the normal-following
+        affine strain convention W = E_slab * (I - 2 n n^T).
+
+    Returns
+    -------
+    energies : torch.Tensor, shape (N,), dtype=float64
+        Per-atom slab correction energy.
+    forces : torch.Tensor, shape (N, 3), dtype matches positions, optional
+        Per-atom slab force (only returned if compute_forces=True).
+    charge_grads : torch.Tensor, shape (N,), dtype=float64, optional
+        Per-atom slab charge gradient (only if compute_charge_gradients=True).
+    virial : torch.Tensor, shape (B, 3, 3), dtype matches positions, optional
+        Per-system slab virial (only if compute_virial=True).
+    """
+    cell, num_systems = _prepare_cell(cell)
+    pbc = _prepare_pbc_for_slab(pbc, num_systems, positions.device)
+    _validate_slab_cell_geometry(cell, pbc)
+
+    if batch_idx is None:
+        batch_idx = torch.zeros(
+            positions.shape[0], dtype=torch.int32, device=positions.device
+        )
+
+    energies, forces, charge_grads, virial = _slab_correction_op(
+        positions, charges, cell, pbc, batch_idx
+    )
+
+    results: tuple[torch.Tensor, ...] = (energies,)
+    if compute_forces:
+        results += (forces,)
+    if compute_charge_gradients:
+        results += (charge_grads,)
+    if compute_virial:
+        results += (virial,)
+
+    if len(results) == 1:
+        return results[0]
+    return results
+
+
 def ewald_summation(
     positions: torch.Tensor,
     charges: torch.Tensor,
@@ -3144,6 +3542,8 @@ def ewald_summation(
     compute_virial: bool = False,
     accuracy: float = 1e-6,
     hybrid_forces: bool = False,
+    pbc: torch.Tensor | None = None,
+    slab_correction: bool = False,
 ) -> tuple[torch.Tensor, ...] | torch.Tensor:
     """Complete Ewald summation for long-range electrostatics.
 
@@ -3192,6 +3592,16 @@ def ewald_summation(
         charge gradients are attached to the energy via a straight-through
         trick.  Forces and virial are forward-only (not differentiable).
         See :func:`ewald_real_space` for details.
+    pbc : torch.Tensor, shape (3,) or (B, 3), dtype=bool, optional
+        Per-system periodic boundary conditions. Required when
+        ``slab_correction=True``. Each row has True for periodic directions
+        and False for the non-periodic (slab) direction. A (3,) tensor is
+        broadcast across all systems in the batch.
+    slab_correction : bool, default=False
+        When True, apply the Yeh-Berkowitz slab correction (with the
+        Ballenegger et al. 2009 Eq. 29 non-neutral extension) to the total
+        energy and to forces/charge_grads/virial when those are requested.
+        Orthorhombic and triclinic slab cells are supported.
 
     Returns
     -------
@@ -3263,17 +3673,79 @@ def ewald_summation(
         hybrid_forces=hybrid_forces,
     )
 
+    # Optional slab correction: returns a same-shape tuple as rs/rec,
+    # so it composes uniformly with the element-wise combination below.
+    slab_tuple: tuple[torch.Tensor, ...] | None = None
+    if slab_correction:
+        if hybrid_forces:
+            slab_out = apply_slab_correction(
+                positions.detach(),
+                charges.detach(),
+                cell.detach(),
+                pbc,
+                batch_idx=batch_idx,
+                compute_forces=compute_forces,
+                compute_charge_gradients=True,
+                compute_virial=compute_virial,
+            )
+            slab_raw = slab_out if isinstance(slab_out, tuple) else (slab_out,)
+            slab_index = 0
+
+            slab_energies = slab_raw[slab_index]
+            slab_index += 1
+
+            slab_forces = None
+            if compute_forces:
+                slab_forces = slab_raw[slab_index]
+                slab_index += 1
+
+            slab_charge_grads = slab_raw[slab_index]
+            slab_index += 1
+
+            slab_virial = None
+            if compute_virial:
+                slab_virial = slab_raw[slab_index]
+
+            if charges.requires_grad:
+                slab_energies = _InjectChargeGrad.apply(
+                    slab_energies, charges, slab_charge_grads, batch_idx
+                )
+
+            slab_tuple = (slab_energies,)
+            if compute_forces and slab_forces is not None:
+                slab_tuple += (slab_forces,)
+            if compute_charge_gradients:
+                slab_tuple += (slab_charge_grads,)
+            if compute_virial and slab_virial is not None:
+                slab_tuple += (slab_virial,)
+        else:
+            slab_out = apply_slab_correction(
+                positions,
+                charges,
+                cell,
+                pbc,
+                batch_idx=batch_idx,
+                compute_forces=compute_forces,
+                compute_charge_gradients=compute_charge_gradients,
+                compute_virial=compute_virial,
+            )
+            slab_tuple = slab_out if isinstance(slab_out, tuple) else (slab_out,)
+
     # Normalize return tuples for element-wise combination
     rs_tuple = rs if isinstance(rs, tuple) else (rs,)
     rec_tuple = rec if isinstance(rec, tuple) else (rec,)
     tuple_index = 0
 
     energies = rs_tuple[tuple_index] + rec_tuple[tuple_index]
+    if slab_tuple is not None:
+        energies = energies + slab_tuple[tuple_index]
     tuple_index += 1
     results: tuple[torch.Tensor, ...] = (energies,)
 
     if compute_forces:
         forces = rs_tuple[tuple_index] + rec_tuple[tuple_index]
+        if slab_tuple is not None:
+            forces = forces + slab_tuple[tuple_index]
         results += (forces,)
         tuple_index += 1
 
@@ -3286,11 +3758,15 @@ def ewald_summation(
             )
         else:
             charge_grads = real_charge_grads + reciprocal_charge_grads
+        if slab_tuple is not None:
+            charge_grads = charge_grads + slab_tuple[tuple_index]
         results += (charge_grads,)
         tuple_index += 1
 
     if compute_virial:
         virial = rs_tuple[tuple_index] + rec_tuple[tuple_index]
+        if slab_tuple is not None:
+            virial = virial + slab_tuple[tuple_index]
         results += (virial,)
 
     if len(results) == 1:
