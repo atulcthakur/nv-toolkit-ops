@@ -118,9 +118,9 @@ from typing import Any
 import warp as wp
 
 # Mathematical constants
-PI = math.pi
-TWOPI = 2.0 * PI
-FOURPI = 4.0 * PI
+PI = wp.constant(wp.float64(math.pi))
+TWOPI = wp.constant(wp.float64(2.0 * math.pi))
+FOURPI = wp.constant(wp.float64(4.0 * math.pi))
 
 
 ###########################################################################################
@@ -410,12 +410,12 @@ def _slab_correction_kernel(
     )
 
     # E_slab_i = (2*pi/V) * q_i * bracket
-    twopi_over_v = wp.float64(TWOPI) / vol
+    twopi_over_v = TWOPI / vol
     e_slab = twopi_over_v * q_f64 * bracket
     energy_out[atom_idx] = energy_in[atom_idx] + e_slab
 
     # F_slab_i = -(4*pi/V) * q_i * (M - Q * z_i) * n
-    fourpi_over_v = wp.float64(FOURPI) / vol
+    fourpi_over_v = FOURPI / vol
     f_slab_mag = -fourpi_over_v * q_f64 * (mz_val - qtot * z_f64)
 
     f_slab = type(pos)(
